@@ -1,0 +1,65 @@
+ARG KONG_MANAGER_VERSION=3.9.0.0
+# ARG KONG_GUI_URL=http://localhost/kong-manager
+
+FROM node:22-alpine AS build
+ARG KONG_MANAGER_VERSION
+# ARG KONG_GUI_URL
+WORKDIR /app
+
+# Download Kong Manager source and Lua libraries
+RUN apk add --no-cache bash curl unzip
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl -fsSL https://github.com/Kong/kong-manager/archive/refs/tags/v${KONG_MANAGER_VERSION}.zip \
+  -o v${KONG_MANAGER_VERSION}.zip && \
+  curl -fsSL https://github.com/zmartzone/lua-resty-openidc/archive/refs/tags/v1.8.0.tar.gz | tar xz -C /tmp && \
+  curl -fsSL https://github.com/bungle/lua-resty-session/archive/refs/tags/v4.1.2.tar.gz | tar xz -C /tmp && \
+  curl -fsSL https://github.com/Kong/deck/releases/download/v1.57.0/deck_1.57.0_linux_amd64.tar.gz | tar -xz -C /tmp 
+
+RUN npm install -g pnpm@latest
+
+RUN unzip v${KONG_MANAGER_VERSION}.zip \
+  && cd kong-manager-${KONG_MANAGER_VERSION} \
+  && pnpm install
+
+ARG NODE_ENV=production
+# ARG DISABLE_BASE_PATH=true
+
+COPY ./patch/App.vue /app/kong-manager-${KONG_MANAGER_VERSION}/src/App.vue
+RUN cd kong-manager-${KONG_MANAGER_VERSION} \
+  && pnpm build
+
+FROM ghcr.io/suriyaruk/kong-oss-3.9.1-patch:3.9.1
+ARG KONG_MANAGER_VERSION
+# ARG KONG_GUI_URL
+COPY --from=build /app/kong-manager-${KONG_MANAGER_VERSION}/dist /usr/local/kong/gui/
+COPY --from=build /tmp/lua-resty-openidc-1.8.0/lib/resty/openidc.lua /usr/local/share/lua/5.1/resty/openidc.lua
+COPY --from=build /tmp/lua-resty-session-4.1.2/lib/resty/session.lua /usr/local/share/lua/5.1/resty/session.lua
+COPY --from=build /tmp/lua-resty-session-4.1.2/lib/resty/session/ /usr/local/share/lua/5.1/resty/session/
+COPY --from=build /tmp/deck /usr/local/bin/deck
+USER 0
+
+# Delete lines 1640-1657 from vault.lua
+RUN sed -i '1640,1657d' /usr/local/share/lua/5.1/kong/pdk/vault.lua
+
+# Remove non-sensitive files (documentation, manifests, tests)
+RUN rm -rf /etc/kong/kong.conf.default
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/kong/3.9.1-0/rock_manifest
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-aws/1.5.4-1/lua-resty-aws-1.5.4-1.rockspec
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-aws/1.5.4-1/rock_manifest
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-gcp/0.0.13-1/lua-resty-gcp-0.0.13-1.rockspec
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-gcp/0.0.13-1/rock_manifest
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/manifest
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-openidc/1.8.0-1/doc/README.md
+RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/appengine_v1.lua
+RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/accessapproval_v1.lua
+RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/contentwarehouse_v1.lua
+RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/networkmanagement_v1.lua
+RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/realtimebidding_v1.lua
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-session/4.0.5-1/doc/README.md
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-session/4.1.2-1/doc/README.md
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/doc/ftp.html
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/doc/http.html
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/test/ftptest.lua
+RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/test/httptest.lua
+
+USER kong
