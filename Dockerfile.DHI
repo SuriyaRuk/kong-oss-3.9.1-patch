@@ -284,6 +284,7 @@ COPY --from=build /tmp/deck /usr/local/bin/deck
 # building, re-verify balancer/DNS, SSL cert_by_lua hooks, and stream proxies.
 # -----------------------------------------------------------------------------
 COPY --from=openresty-build /usr/local/openresty /usr/local/openresty
+COPY --from=openresty-build /usr/local/share/lua/5.1/kong /usr/local/share/lua/5.1/kong
 
 # Patch Kong's hard version check. kong/meta.lua declares:
 #   _DEPENDENCIES = { nginx = { "1.25.3.2" } }
