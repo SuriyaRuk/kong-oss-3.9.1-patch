@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-TAG=${1:-3.9.1-oidc-logout-1.29.2.5}
+TAG=${1:-1.29.2.5}
 
 BUILDER_NAME="multiarch"
 
@@ -15,7 +15,7 @@ fi
 docker buildx build \
   --builder "${BUILDER_NAME}" \
   --platform linux/amd64,linux/arm64 \
-  -f Dockerfile.DHI \
+  -f Dockerfile.DHI-without-oidc \
   -t suriyaruk/kong-oss-3.9.1-patch:${TAG} \
   --push \
   .
