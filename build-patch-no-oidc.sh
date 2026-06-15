@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-TAG=${1:-1.29.2.5}
+TAG=${1:-3.9.2-1.31.1.1}
 
 BUILDER_NAME="multiarch"
 
