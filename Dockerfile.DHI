@@ -8,14 +8,11 @@
 ARG KONG_MANAGER_VERSION=3.9.0.0
 
 # -----------------------------------------------------------------------------
-# Stage: build — Kong Manager UI + extra Lua libs (OIDC/session) + deck CLI.
+# Stage: build — Kong Manager UI + extra Lua libs (OIDC/session).
+# (The deck CLI is built separately from source in the deck-build stage below.)
 # -----------------------------------------------------------------------------
 FROM node:22-alpine AS build
 ARG KONG_MANAGER_VERSION
-# TARGETARCH is provided automatically by buildx (amd64 / arm64) and matches
-# deck's release asset naming exactly.
-ARG TARGETARCH
-ARG DECK_VERSION=1.57.0
 WORKDIR /app
 
 RUN apk add --no-cache bash curl unzip
@@ -24,10 +21,6 @@ RUN curl -fsSL https://github.com/Kong/kong-manager/archive/refs/tags/v${KONG_MA
   -o v${KONG_MANAGER_VERSION}.zip && \
   curl -fsSL https://github.com/zmartzone/lua-resty-openidc/archive/refs/tags/v1.8.0.tar.gz | tar xz -C /tmp && \
   curl -fsSL https://github.com/bungle/lua-resty-session/archive/refs/tags/v4.1.2.tar.gz | tar xz -C /tmp
-
-# deck CLI — fetch the build-target architecture (amd64 or arm64).
-RUN curl -fsSL "https://github.com/Kong/deck/releases/download/v${DECK_VERSION}/deck_${DECK_VERSION}_linux_${TARGETARCH}.tar.gz" \
-  | tar -xz -C /tmp
 
 RUN npm install -g pnpm@latest
 
@@ -40,6 +33,28 @@ ARG NODE_ENV=production
 COPY ./patch/App.vue /app/kong-manager-${KONG_MANAGER_VERSION}/src/App.vue
 RUN cd kong-manager-${KONG_MANAGER_VERSION} \
   && pnpm build
+
+# -----------------------------------------------------------------------------
+# Stage: deck-build — rebuild the deck CLI from source with a current Go
+# toolchain instead of shipping the prebuilt release binary. Trivy scans Go
+# binaries by their embedded build info regardless of the OS base, and the
+# published deck binary carries whatever Go-stdlib CVEs its release toolchain
+# had. Rebuilding the SAME v${DECK_VERSION} tag with Go 1.26 clears those
+# stdlib findings without changing deck's behaviour. CGO_ENABLED=0 -> static
+# binary that runs on the hardened (musl) Alpine base alongside glibc.
+# -----------------------------------------------------------------------------
+FROM golang:1.26-bookworm AS deck-build
+ARG DECK_VERSION=1.57.0
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 -b v${DECK_VERSION} https://github.com/Kong/deck.git /src
+WORKDIR /src
+# ldflags mirror deck's upstream .goreleaser.yml so `deck version` reports
+# correctly; an unknown -X target is silently ignored, so this is non-breaking.
+RUN CGO_ENABLED=0 go build -trimpath \
+  -ldflags="-s -w -X github.com/kong/deck/cmd.VERSION=v${DECK_VERSION} -X github.com/kong/deck/cmd.COMMIT=$(git rev-parse --short HEAD)" \
+  -o /deck . \
+  && /deck version
 
 # -----------------------------------------------------------------------------
 # Stage: glibc — glibc runtime (+ libstdc++ for Kong's C++/Rust native libs).
@@ -157,7 +172,7 @@ COPY --from=build /app/kong-manager-${KONG_MANAGER_VERSION}/dist /usr/local/kong
 COPY --from=build /tmp/lua-resty-openidc-1.8.0/lib/resty/openidc.lua /usr/local/share/lua/5.1/resty/openidc.lua
 COPY --from=build /tmp/lua-resty-session-4.1.2/lib/resty/session.lua /usr/local/share/lua/5.1/resty/session.lua
 COPY --from=build /tmp/lua-resty-session-4.1.2/lib/resty/session/ /usr/local/share/lua/5.1/resty/session/
-COPY --from=build /tmp/deck /usr/local/bin/deck
+COPY --from=deck-build /deck /usr/local/bin/deck
 
 # Delete the @usage doc comment block (lines 1640-1657) from vault.lua.
 RUN sed -i '1640,1657d' /usr/local/share/lua/5.1/kong/pdk/vault.lua
