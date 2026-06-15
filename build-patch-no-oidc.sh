@@ -16,6 +16,6 @@ docker buildx build \
   --builder "${BUILDER_NAME}" \
   --platform linux/amd64,linux/arm64 \
   -f Dockerfile.DHI-without-oidc \
-  -t suriyaruk/kong-oss-3.9.1-patch:${TAG} \
+  -t suriyaruk/kong-oss-3.9.2-patch:${TAG} \
   --push \
   .
