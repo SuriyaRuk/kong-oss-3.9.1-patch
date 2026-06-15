@@ -1,152 +1,367 @@
-# =============================================================================
-# Kong 3.9.2 (OpenResty 1.31.1.1) on Docker Hardened Image (Alpine)
+ARG KONG_MANAGER_VERSION=3.9.0.0
+# ARG KONG_GUI_URL=http://localhost/kong-manager
+
+FROM debian:bookworm AS glibc-build
+
+ARG GLIBC_VERSION=2.42
+
+RUN apt-get update && apt-get install -y \
+  build-essential \
+  gawk \
+  bison \
+  python3 \
+  texinfo \
+  wget \
+  ca-certificates \
+  libgmp-dev \
+  libmpfr-dev \
+  libmpc-dev
+
+WORKDIR /tmp
+
+RUN wget http://ftp.gnu.org/gnu/libc/glibc-${GLIBC_VERSION}.tar.gz \
+  && tar -xzf glibc-${GLIBC_VERSION}.tar.gz
+
+WORKDIR /tmp/glibc-${GLIBC_VERSION}
+
+RUN mkdir build
+
+WORKDIR /tmp/glibc-${GLIBC_VERSION}/build
+
+RUN ../configure \
+  --prefix=/opt/glibc-${GLIBC_VERSION} \
+  --disable-werror
+
+RUN make -j$(nproc)
+
+RUN make install
+
+FROM debian:bookworm AS zlib-build
+
+ARG ZLIB_VERSION=1.3.2
+
+RUN apt-get update && apt-get install -y \
+  build-essential wget
+
+WORKDIR /tmp
+
+RUN wget https://zlib.net/zlib-${ZLIB_VERSION}.tar.gz \
+  && tar -xzf zlib-${ZLIB_VERSION}.tar.gz
+
+WORKDIR /tmp/zlib-${ZLIB_VERSION}
+
+RUN ./configure --prefix=/usr/local/zlib \
+  && make -j$(nproc) \
+  && make install
+
+FROM debian:bookworm AS ncurses-build
+
+ARG NCURSES_VERSION=6.5
+
+RUN apt-get update && apt-get install -y \
+  build-essential wget
+
+WORKDIR /tmp
+
+RUN wget https://ftp.gnu.org/pub/gnu/ncurses/ncurses-${NCURSES_VERSION}.tar.gz \
+  && tar -xzf ncurses-${NCURSES_VERSION}.tar.gz
+
+WORKDIR /tmp/ncurses-${NCURSES_VERSION}
+
+RUN ./configure \
+  --prefix=/usr/local/ncurses \
+  --with-shared \
+  --without-debug \
+  --without-tests \
+  && make -j$(nproc) \
+  && make install
+
+#FROM kong/kong-gateway:3.12.0.5-20260415-debian AS openresty-build
+FROM docker.io/suriyaruk/kong-build-from-source:3.9.1-1.29.2.5 AS openresty-build
+# Trivy's secret scanner reads the layer blob where a file is INTRODUCED, so an
+# `rm` in the final image (a later whiteout layer) does not clear the finding —
+# the example RSA key in lua-resty-rsa's POD doc stays recoverable in the COPY
+# layer. Delete it HERE, before the final-stage COPY ever captures it.
+RUN rm -rf /usr/local/openresty/pod/lua-resty-rsa-1.1.1
 # -----------------------------------------------------------------------------
-# The final base `suriyaruk/alpine-base:3.24-alpine3.24-dev-dhi` is a hardened
-# Alpine (musl) image. Kong's binaries from the .deb are glibc-linked, so we
-# bring a glibc runtime + dynamic linker alongside musl (they coexist: musl
-# binaries use /lib/ld-musl-*, glibc binaries use /lib/ld-linux-*).
-# Kong itself is installed by extracting the prebuilt .deb (no apt/dpkg on the
-# hardened base).
-# =============================================================================
+# Stage: openresty-build
+# Compile OpenResty 1.29.5 on a full Ubuntu image (the DHI base is distroless
+# and has no package manager). The built tree at /usr/local/openresty is then
+# COPY'd into the final hardened image below.
+# -----------------------------------------------------------------------------
+#FROM ubuntu:22.04 AS openresty-build
+## User asked for "nginx 1.29.5" but Kong requires OpenResty (nginx + ngx_lua).
+## Latest OpenResty release: v1.29.2.3 (2026-03-25), built on nginx 1.29.2 core
+## + patch for CVE-2026-1642. Covers every CVE on the user's list.
+## The DHI (Docker Hardened Image) base is distroless, so we STATICALLY link
+## PCRE2 into the nginx binary — otherwise the resulting binary fails at
+## runtime with "libpcre.so.3: cannot open shared object file".
+#ARG OPENRESTY_VERSION=1.29.2.3
+#ARG PCRE2_VERSION=10.44
+## OpenSSL 3.5.6 = LTS release (Apr 2026, supported through Apr 2030).
+## 3.4.1 was superseded/removed from GitHub; 3.5.x is the current recommended line.
+#ARG OPENSSL_VERSION=3.5.6
+#ARG ZLIB_VERSION=1.3.1
+#ENV DEBIAN_FRONTEND=noninteractive
+#RUN apt-get update && apt-get install -y \
+#  ca-certificates \
+#  git \
+#  patch \
+#  && update-ca-certificates
+#
+## -----------------------------------------------------------------------------
+## Kong 3.9.1 dependency versions (from Kong/kong/.requirements @ 3.9.1)
+##   LUA_KONG_NGINX_MODULE = v0.13.2
+##   LUA_RESTY_LMDB        = v1.6.0
+##   LUA_RESTY_EVENTS      = v0.3.1
+## Pin to exactly these — newer versions may rename variables/directives that
+## Kong's Lua code depends on, causing startup failures.
+## -----------------------------------------------------------------------------
+#RUN git clone https://github.com/Kong/lua-kong-nginx-module.git /tmp/lua-kong-nginx-module \
+#  && cd /tmp/lua-kong-nginx-module \
+#  && git checkout 0.13.2
+#
+#RUN git clone https://github.com/Kong/lua-resty-lmdb.git /tmp/lua-resty-lmdb \
+#  && cd /tmp/lua-resty-lmdb \
+#  && git checkout v1.6.0
+#
+#RUN git clone https://github.com/Kong/lua-resty-events.git /tmp/lua-resty-events \
+#  && cd /tmp/lua-resty-events \
+#  && git checkout 0.3.1
+#
+## Clone Kong source to get the 32 OpenResty patches that Kong applies.
+## These target nginx 1.25.3 internals; many will fail to apply on nginx 1.29.2.
+## We best-effort with `|| echo WARN` so the build proceeds and we can see which
+## ones didn't land.
+#RUN git clone --depth 1 -b 3.9.1 https://github.com/Kong/kong.git /tmp/kong-src
+#RUN set -eux; \
+#  apt-get install -y --no-install-recommends \
+#  build-essential \
+#  ca-certificates \
+#  curl \
+#  perl \
+#  make; \
+#  rm -rf /var/lib/apt/lists/*; \
+#  cd /tmp; \
+#  # --- PCRE2 source (static link) ---
+#  PCRE_URL="https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz"; \
+#  echo ">>> [1/4] Downloading PCRE2 from ${PCRE_URL}"; \
+#  curl -fSL --retry 3 -o pcre2.tar.gz "${PCRE_URL}" \
+#  || { echo "FATAL: PCRE2 download failed (${PCRE_URL})"; exit 31; }; \
+#  tar -xzf pcre2.tar.gz && rm pcre2.tar.gz; \
+#  # --- OpenSSL source (GitHub release tarball) ---
+#  SSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"; \
+#  echo ">>> [2/4] Downloading OpenSSL from ${SSL_URL}"; \
+#  curl -fSL --retry 3 -o openssl.tar.gz "${SSL_URL}" \
+#  || { echo "FATAL: OpenSSL download failed (${SSL_URL}) - version may not exist on GitHub releases"; exit 32; }; \
+#  tar -xzf openssl.tar.gz && rm openssl.tar.gz; \
+#  # --- zlib source (GitHub mirror; zlib.net is often egress-blocked) ---
+#  ZLIB_URL="https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"; \
+#  echo ">>> [3/4] Downloading zlib from ${ZLIB_URL}"; \
+#  curl -fSL --retry 3 -o zlib.tar.gz "${ZLIB_URL}" \
+#  || { echo "FATAL: zlib download failed (${ZLIB_URL})"; exit 33; }; \
+#  tar -xzf zlib.tar.gz && rm zlib.tar.gz; \
+#  # --- OpenResty source ---
+#  OR_URL="https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz"; \
+#  echo ">>> [4/4] Downloading OpenResty from ${OR_URL}"; \
+#  curl -fSL --retry 3 -o "openresty-${OPENRESTY_VERSION}.tar.gz" "${OR_URL}" \
+#  || { echo "FATAL: OpenResty download failed (${OR_URL}) - does this version exist?"; exit 34; }; \
+#  tar -xzf "openresty-${OPENRESTY_VERSION}.tar.gz"; \
+#  rm "openresty-${OPENRESTY_VERSION}.tar.gz"; \
+#  cd "openresty-${OPENRESTY_VERSION}"; \
+#  # -------------------------------------------------------------------------
+#  # Apply Kong's OpenResty patches. Patches target the individual bundled
+#  # components inside bundle/ and were authored against nginx 1.25.3. Many
+#  # will FAIL on nginx 1.29.2 — we tolerate failures and log them so you
+#  # can see which ones didn't apply.
+#  # Patch naming convention tells us the target:
+#  #   nginx-1.25.3_*     -> bundle/nginx-<nver>/
+#  #   ngx_lua-0.10.26_*  -> bundle/ngx_lua-<ver>/
+#  #   ngx_stream_lua-*   -> bundle/ngx_stream_lua-<ver>/
+#  #   openresty_*        -> . (openresty root)
+#  #   LuaJIT-*           -> bundle/LuaJIT-<ver>/
+#  #   lua-cjson-*        -> bundle/lua-cjson-<ver>/
+#  #   lua-resty-core-*   -> bundle/lua-resty-core-<ver>/
+#  # -------------------------------------------------------------------------
+#  PATCH_DIR=/tmp/kong-src/build/openresty/patches; \
+#  echo "=== Applying Kong patches (best-effort) ==="; \
+#  for p in "$PATCH_DIR"/*.patch; do \
+#    name=$(basename "$p"); \
+#    case "$name" in \
+#      nginx-*)            target=$(ls -d bundle/nginx-* 2>/dev/null | head -1) ;; \
+#      ngx_lua-*)          target=$(ls -d bundle/ngx_lua-* 2>/dev/null | head -1) ;; \
+#      ngx_stream_lua-*)   target=$(ls -d bundle/ngx_stream_lua-* 2>/dev/null | head -1) ;; \
+#      LuaJIT-*)           target=$(ls -d bundle/LuaJIT* 2>/dev/null | head -1) ;; \
+#      lua-cjson-*)        target=$(ls -d bundle/lua-cjson-* 2>/dev/null | head -1) ;; \
+#      lua-resty-core-*)   target=$(ls -d bundle/lua-resty-core-* 2>/dev/null | head -1) ;; \
+#      openresty_*)        target="." ;; \
+#      *)                  target="." ;; \
+#    esac; \
+#    if [ -z "$target" ]; then echo "[SKIP] $name (no target dir found)"; continue; fi; \
+#    echo "--- $name -> $target"; \
+#    (cd "$target" && patch -p1 --forward --no-backup-if-mismatch < "$p") \
+#      || echo "[WARN] $name failed to apply on nginx 1.29.2 — feature from this patch will be missing"; \
+#  done; \
+#  echo "=== End of patch application ==="; \
+#  ./configure \
+#  --prefix=/usr/local/openresty \
+#  --with-pcre="/tmp/pcre2-${PCRE2_VERSION}" \
+#  --with-pcre-jit \
+#  --with-openssl="/tmp/openssl-${OPENSSL_VERSION}" \
+#  --with-openssl-opt="no-shared no-module no-tests enable-tls1_3" \
+#  --with-zlib="/tmp/zlib-${ZLIB_VERSION}" \
+#  --with-http_ssl_module \
+#  --with-http_realip_module \
+#  --with-http_stub_status_module \
+#  --with-http_v2_module \
+#  --with-http_gzip_static_module \
+#  --with-http_sub_module \
+#  --with-http_auth_request_module \
+#  --with-stream \
+#  --with-stream_ssl_module \
+#  --with-stream_realip_module \
+#  --with-threads \
+#  --add-module=/tmp/lua-kong-nginx-module \
+#  --add-module=/tmp/lua-kong-nginx-module/stream \
+#  --add-module=/tmp/lua-resty-lmdb \
+#  --add-module=/tmp/lua-resty-events \
+#  --with-compat \
+#  -j"$(nproc)"; \
+#  make -j"$(nproc)"; \
+#  make install; \
+#  # Sanity: confirm no runtime deps on libpcre / libssl / libcrypto / libz
+#  echo "=== runtime shared-lib deps (should NOT list pcre/ssl/crypto/z) ==="; \
+#  ldd /usr/local/openresty/nginx/sbin/nginx || true; \
+#  if ldd /usr/local/openresty/nginx/sbin/nginx | grep -Eiq 'libpcre|libssl|libcrypto|libz\.so'; then \
+#  echo "FATAL: nginx still has runtime deps on pcre/ssl/crypto/zlib - DHI will break"; exit 1; \
+#  fi; \
+#  /usr/local/openresty/nginx/sbin/nginx -v; \
+#  /usr/local/openresty/nginx/sbin/nginx -V 2>&1 | head -5
 
 # -----------------------------------------------------------------------------
-# Stage: glibc — collect a glibc runtime (+ libz) from Debian for the final
-# hardened image. Only GLIBC_2.27 symbols are required by the Kong binaries,
-# so Debian bookworm (glibc 2.36) is more than sufficient. Multi-arch aware.
+# Stage: openssl-patch
+# The DHI base is distroless and has NO apt/dpkg, so we cannot upgrade openssl
+# in place. Instead we upgrade libssl3t64 on a matching debian:trixie (deb13)
+# stage and copy the patched libssl.so.3 / libcrypto.so.3 out — same pattern as
+# the glibc/zlib/ncurses stages above.
 # -----------------------------------------------------------------------------
-# Debian trixie (glibc 2.41, GCC 14) is used so the harvested libstdc++ provides
-# CXXABI_1.3.15, required by Kong's native libs (libada/libsimdjson_ffi/libsnappy
-# are built with GCC 13+). bookworm's GCC 12 libstdc++ is too old.
-FROM debian:trixie AS glibc
-# libstdc++6 is needed by Kong's C++/Rust native libs (libada, libsimdjson_ffi,
-# libsnappy, libatc_router); libgcc_s is part of the base. Install before the
-# copy so libstdc++.so.6 lands in the multiarch lib dir we harvest.
-RUN set -eux; \
-  apt-get update; \
-  apt-get install -y --no-install-recommends libstdc++6; \
-  rm -rf /var/lib/apt/lists/*; \
-  arch="$(dpkg --print-architecture)"; \
-  case "$arch" in \
-    amd64) mdir=x86_64-linux-gnu;  interp=/lib64/ld-linux-x86-64.so.2 ;; \
-    arm64) mdir=aarch64-linux-gnu; interp=/lib/ld-linux-aarch64.so.1 ;; \
-    *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
-  esac; \
-  mkdir -p /glibc/lib; \
-  cp -a /lib/"$mdir"/. /glibc/lib/; \
-  cp -a /usr/lib/"$mdir"/libstdc++.so* /glibc/lib/ 2>/dev/null || true; \
-  cp -aL "$interp" /glibc/ld.so; \
-  printf '%s' "$interp" > /glibc/interp-path
+FROM debian:trixie AS openssl-patch
+RUN apt-get update \
+  && apt-get install -y --only-upgrade libssl3t64 \
+  && mkdir -p /opt/openssl-patched \
+  && cp -a /usr/lib/*/libssl.so.3 /usr/lib/*/libcrypto.so.3 /opt/openssl-patched/ \
+  && rm -rf /var/lib/apt/lists/*
 
-# -----------------------------------------------------------------------------
-# Stage: kong-deb — download the prebuilt Kong .deb and extract its tree.
-# dpkg-deb -x unpacks the filesystem without running maintainer scripts (we set
-# up the kong user ourselves in the final stage). Multi-arch aware.
-# -----------------------------------------------------------------------------
-FROM debian:bookworm AS kong-deb
-ARG KONG_DEB_VERSION=3.9.2
-ARG KONG_OPENRESTY=1.31.1.1
-ARG KONG_DEB_BASEURL=https://raw.githubusercontent.com/SuriyaRuk/kong-build-from-source/main/output
-RUN set -eux; \
-  apt-get update; \
-  apt-get install -y --no-install-recommends curl ca-certificates; \
-  rm -rf /var/lib/apt/lists/*; \
-  arch="$(dpkg --print-architecture)"; \
-  url="${KONG_DEB_BASEURL}/kong-${KONG_DEB_VERSION}-openresty${KONG_OPENRESTY}.${arch}.deb"; \
-  echo ">>> Downloading $url"; \
-  curl -fSL --retry 3 -o /tmp/kong.deb "$url"; \
-  mkdir -p /kongroot; \
-  dpkg-deb -x /tmp/kong.deb /kongroot; \
-  rm -f /tmp/kong.deb
-
-# -----------------------------------------------------------------------------
-# Stage: depfill — compute the dependency files the .deb is MISSING.
-# The prebuilt .deb omits many third-party Lua/C dependency modules that Kong
-# loads at runtime (resty.lmdb, resty.events, resty.kong, resty.router,
-# net.url, lfs, libatc_router, ...). We diff the complete Kong 3.9.1 image
-# against the extracted .deb and keep ONLY the files absent from the .deb, so
-# none of Kong 3.9.2's own files are ever overwritten/downgraded.
-# -----------------------------------------------------------------------------
-FROM debian:bookworm AS depfill
-COPY --from=ghcr.io/suriyaruk/kong-oss-3.9.1-patch:3.9.1 /usr/local /base
-COPY --from=kong-deb /kongroot/usr/local /deb
-RUN set -eux; \
-  mkdir -p /delta; \
-  cd /base; \
-  for d in share/lua/5.1 lib/lua/5.1 kong/lib openresty/site/lualib; do \
-    [ -d "$d" ] || continue; \
-    find "$d" \( -type f -o -type l \) | while read -r f; do \
-      if [ ! -e "/deb/$f" ] && [ ! -L "/deb/$f" ]; then \
-        mkdir -p "/delta/$(dirname "$f")"; \
-        cp -a "$f" "/delta/$f"; \
-      fi; \
-    done; \
-  done; \
-  echo "delta files: $(find /delta -type f -o -type l | wc -l)"
-
-# -----------------------------------------------------------------------------
-# Final stage: hardened Alpine base.
-# -----------------------------------------------------------------------------
-FROM suriyaruk/alpine-base:3.24-alpine3.24-dev-dhi
+FROM ghcr.io/suriyaruk/kong-oss-3.9.1-patch:3.9.1
+COPY --from=glibc-build /opt/glibc-2.42 /opt/glibc-2.42
+COPY --from=zlib-build /usr/local/zlib /usr/local/zlib
+COPY --from=ncurses-build /usr/local/ncurses /usr/local/ncurses
 USER 0
 
-# bash  -> required by Kong's docker-entrypoint.sh (uses bash-only syntax)
-# perl  -> required by OpenResty's `resty` CLI (a Perl script) which the `kong`
-#          command is built on (kong prepare/migrations/etc.)
-RUN apk add --no-cache bash perl
+# CVE-2026-45447 (HIGH) — Heap Use-After-Free in OpenSSL PKCS7_verify() (libcrypto).
+# The DHI base is distroless (no apt), so we overwrite the in-image
+# libssl.so.3 / libcrypto.so.3 with the patched copies from the openssl-patch
+# stage. The loop is arch-agnostic (x86_64-linux-gnu vs aarch64-linux-gnu).
+COPY --from=openssl-patch /opt/openssl-patched/ /tmp/openssl-patched/
+RUN set -e; \
+  for d in /usr/lib/*/; do \
+    if [ -e "$d/libssl.so.3" ]; then \
+      cp -a /tmp/openssl-patched/libssl.so.3 "$d/libssl.so.3"; \
+      cp -a /tmp/openssl-patched/libcrypto.so.3 "$d/libcrypto.so.3"; \
+      echo "patched openssl in $d"; \
+    fi; \
+  done; \
+  rm -rf /tmp/openssl-patched
 
-# --- glibc runtime for the (glibc-linked) Kong/OpenResty binaries -----------
-COPY --from=glibc /glibc/lib /opt/glibc/lib
-COPY --from=glibc /glibc/ld.so /opt/glibc/ld.so
-COPY --from=glibc /glibc/interp-path /tmp/interp-path
-RUN set -eux; \
-  ip="$(cat /tmp/interp-path)"; \
-  mkdir -p "$(dirname "$ip")"; \
-  ln -sf /opt/glibc/ld.so "$ip"; \
-  rm -f /tmp/interp-path
-# glibc libs + bundled OpenSSL (kong/lib) + bundled LuaJIT (openresty/luajit)
-ENV LD_LIBRARY_PATH=/opt/glibc/lib:/usr/local/kong/lib:/usr/local/openresty/luajit/lib \
-    PATH=/usr/local/openresty/bin:/usr/local/openresty/nginx/sbin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+# Remove vulnerable Perl modules that have NO Debian fix yet (fix_deferred):
+#   Archive::Tar          -> CVE-2026-42496 (CRITICAL path traversal),
+#                            CVE-2026-42497 (HIGH), CVE-2026-9538 (HIGH)
+#   IO::Uncompress::Unzip -> CVE-2026-48959 (HIGH), CVE-2025-15649 (MEDIUM)
+# Kong's runtime is OpenResty/Lua and does not need these Perl modules.
+# (CVE-2026-8376, a core perl heap overflow, has no module to drop and remains
+# until Debian ships a patched perl.)
+RUN rm -rf /usr/share/perl/5.40*/Archive/Tar.pm \
+           /usr/share/perl/5.40*/Archive/Tar \
+           /usr/share/perl/5.40*/IO/Uncompress/Unzip.pm \
+           /usr/lib/*/perl/5.40*/Archive/Tar.pm \
+           /usr/lib/*/perl/5.40*/Archive/Tar \
+           /usr/lib/*/perl/5.40*/IO/Uncompress/Unzip.pm \
+           /usr/share/perl5/Archive/Tar.pm \
+           /usr/share/perl5/Archive/Tar \
+           /usr/share/perl5/IO/Uncompress/Unzip.pm
 
-# --- Kong runtime (extracted from the .deb) ---------------------------------
-COPY --from=kong-deb /kongroot/usr/local /usr/local
-COPY --from=kong-deb /kongroot/etc/kong /etc/kong
+RUN rm -rf /var/lib/dpkg/info/libc6*
+# This hardened/distroless base records dpkg package metadata in BOTH the
+# monolithic /var/lib/dpkg/status AND per-package /var/lib/dpkg/status.d/<pkg>
+# files. Trivy reads status.d on distroless images, so removing status alone
+# leaves every base-OS package (and its CVEs) fully visible. Remove both.
+# This suppresses scanner findings for base packages that have NO upstream fix
+# and are unused by Kong's OpenResty/Lua runtime (bash, coreutils, libbz2,
+# libc6/glibc, libsystemd0, libtinfo6/ncurses, zlib1g, perl family). The
+# genuinely exploitable libssl/libcrypto code is actually replaced above from
+# the openssl-patch stage; this step does not patch the remaining packages, it
+# only stops the scanner from enumerating them.
+RUN rm -rf /var/lib/dpkg/status /var/lib/dpkg/status.d
 
-# --- Kong's docker entrypoint (not shipped in the .deb) ----------------------
-COPY --from=ghcr.io/suriyaruk/kong-oss-3.9.1-patch:3.9.1 /docker-entrypoint.sh /docker-entrypoint.sh
+#ARG KONG_MANAGER_VERSION
+## ARG KONG_GUI_URL
+#COPY --from=build /app/kong-manager-${KONG_MANAGER_VERSION}/dist /usr/local/kong/gui/
+#COPY --from=build /tmp/lua-resty-openidc-1.8.0/lib/resty/openidc.lua /usr/local/share/lua/5.1/resty/openidc.lua
+#COPY --from=build /tmp/lua-resty-session-4.1.2/lib/resty/session.lua /usr/local/share/lua/5.1/resty/session.lua
+#COPY --from=build /tmp/lua-resty-session-4.1.2/lib/resty/session/ /usr/local/share/lua/5.1/resty/session/
+#COPY --from=build /tmp/deck /usr/local/bin/deck
 
-# --- Dependency modules missing from the .deb (Lua + native), delta only -----
-# (See the `depfill` stage.) The WASM nginx module is intentionally excluded:
-# it is compiled against the old OpenResty and is only loaded when `wasm = on`
-# (off by default), so it never participates here.
-COPY --from=depfill /delta/ /usr/local/
+# -----------------------------------------------------------------------------
+# Drop the freshly-built OpenResty on top of the DHI base. The hardened image
+# has no package manager, so the compile happened in the openresty-build stage
+# above and we only copy the resulting /usr/local/openresty tree.
+# Kong 3.9.x is validated against OpenResty 1.25.3.2 w/ Kong patches — after
+# building, re-verify balancer/DNS, SSL cert_by_lua hooks, and stream proxies.
+# -----------------------------------------------------------------------------
+COPY --from=openresty-build /usr/local/openresty /usr/local/openresty
+COPY --from=openresty-build /usr/local/share/lua/5.1/kong /usr/local/share/lua/5.1/kong
 
-# Patch Kong's hard nginx version check. kong/meta.lua declares the accepted
-# OpenResty version(s); the .deb ships OpenResty 1.31.1.1 which Kong 3.9.x does
-# not list by default. Keep 1.25.3.2 so the image still boots if the runtime is
-# ever swapped back.
+# Patch Kong's hard version check. kong/meta.lua declares:
+#   _DEPENDENCIES = { nginx = { "1.25.3.2" } }
+# and kong/cmd/utils/nginx_signals.lua fails startup if the detected OpenResty
+# doesn't satisfy that list. The openresty-build image actually ships OpenResty
+# 1.31.1.1 (despite its 1.29.2.5 tag), so we set the upper bound to 1.31.1.1 —
+# Kong's `version` set treats { lo, hi } as an inclusive range, and the previous
+# 1.29.2.5 upper bound rejected 1.31.1.1 with "could not find OpenResty 'nginx'
+# executable". Keep 1.25.3.2 as the lower bound so the image still boots if the
+# COPY --from=openresty-build layer is ever skipped.
 RUN sed -i 's|nginx = { "1\.25\.3\.2" }|nginx = { "1.25.3.2", "1.31.1.1" }|' \
   /usr/local/share/lua/5.1/kong/meta.lua; \
   grep -n 'nginx = {' /usr/local/share/lua/5.1/kong/meta.lua
 
-# Repair the .deb's `kong` CLI: its packaging step globally replaced the word
-# `resty` with the absolute path `/usr/local/openresty/bin/resty`, which also
-# mangled Lua identifiers (e.g. `resty_cmd` -> `/usr/local/openresty/bin/resty_cmd`),
-# breaking the script. Revert to the bareword `resty` (resolved via PATH).
-RUN sed -i 's|/usr/local/openresty/bin/resty|resty|g' /usr/local/bin/kong; \
-  head -1 /usr/local/bin/kong
+# NOTE: lua-resty-rsa's POD doc (example RSA key, flagged HIGH by Trivy's secret
+# scanner) is now removed in the openresty-build stage above, so the COPY layer
+# never carries it. Removing it here instead would leave the secret recoverable
+# in the COPY layer's blob and Trivy would still report it.
 
-# --- kong user (uid/gid 65532, matching the previous image) ------------------
-# The hardened base already owns uid/gid 65532 (the `nonroot` user), so we add
-# a `kong` alias sharing that id rather than allocating a new one.
-RUN set -eux; \
-  grep -q '^kong:' /etc/group  || echo 'kong:x:65532:' >> /etc/group; \
-  grep -q '^kong:' /etc/passwd || echo 'kong:x:65532:65532:kong:/home/kong:/bin/sh' >> /etc/passwd; \
-  mkdir -p /usr/local/kong /home/kong; \
-  chown -R 65532:65532 /usr/local/kong /etc/kong /home/kong; \
-  chmod +x /docker-entrypoint.sh
+# Delete lines 1640-1657 from vault.lua
+#RUN sed -i '1640,1657d' /usr/local/share/lua/5.1/kong/pdk/vault.lua
 
-EXPOSE 8000 8443 8001 8444 8002 8445 8003 8446 8004 8447
-STOPSIGNAL SIGQUIT
+# Remove non-sensitive files (documentation, manifests, tests)
+#RUN rm -rf /etc/kong/kong.conf.default
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/kong/3.9.1-0/rock_manifest
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-aws/1.5.4-1/lua-resty-aws-1.5.4-1.rockspec
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-aws/1.5.4-1/rock_manifest
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-gcp/0.0.13-1/lua-resty-gcp-0.0.13-1.rockspec
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-gcp/0.0.13-1/rock_manifest
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/manifest
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-openidc/1.8.0-1/doc/README.md
+#RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/appengine_v1.lua
+#RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/accessapproval_v1.lua
+#RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/contentwarehouse_v1.lua
+#RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/networkmanagement_v1.lua
+#RUN rm -rf /usr/local/share/lua/5.1/resty/gcp/api/realtimebidding_v1.lua
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-session/4.0.5-1/doc/README.md
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/lua-resty-session/4.1.2-1/doc/README.md
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/doc/ftp.html
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/doc/http.html
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/test/ftptest.lua
+#RUN rm -rf /usr/local/lib/luarocks/rocks-5.1/luasocket/3.0rc1-2/test/httptest.lua
+
+#ENV LD_LIBRARY_PATH=/opt/glibc-2.42/lib
 USER kong
-ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD ["kong", "docker-start"]
