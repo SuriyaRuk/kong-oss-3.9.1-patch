@@ -1,0 +1,5 @@
+{"file":"Dockerfile.DHI","action":"Edit","timestamp":"2026-06-15T12:10:19Z","important":false}
+{"file":"Dockerfile.DHI-without-oidc","action":"Edit","timestamp":"2026-06-15T12:10:21Z","important":false}
+{"file":"build-patch.sh","action":"Edit","timestamp":"2026-06-15T12:56:01Z","important":false}
+{"file":"build-patch-no-oidc.sh","action":"Edit","timestamp":"2026-06-15T12:56:02Z","important":false}
+{"file":"/tmp/pr-body.md","action":"Write","timestamp":"2026-06-15T12:59:49Z","important":false}
